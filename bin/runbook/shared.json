@@ -3,10 +3,10 @@
     "opencode",
     "claude-code",
     "codex",
-    "cursor",
-    "copilot",
     "pi",
-    "deepseek-harness"
+    "copilot",
+    "deepseek-harness",
+    "cursor"
   ],
   "defaults": {
     "model": "subconscious/glm-5.3-marathon",

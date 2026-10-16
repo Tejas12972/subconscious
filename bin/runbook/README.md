@@ -8,13 +8,13 @@ the default gateway, model capabilities, and the settings every agent uses
 
 | Agent | Launch | Setup |
 | --- | --- | --- |
+| `opencode` | binary | `install.sh` (leftover status/uninstall) |
 | `claude-code` | binary | `install.sh` (leftover status/uninstall) |
 | `codex` | `run.sh` | `install.sh` (hooks) |
-| `opencode` | binary | `install.sh` (leftover status/uninstall) |
-| `cursor` | none | `install.sh` (hooks) |
-| `copilot` | none | `install.sh` (provider and hooks) |
 | `pi` | `run.sh` | `install.sh` (provider and extensions) |
+| `copilot` | none | `install.sh` (provider and hooks) |
 | `deepseek-harness` | `run.sh` | none |
+| `cursor` | none | `install.sh` (hooks) |
 
 ## What `agent.json` holds and who reads it
 
