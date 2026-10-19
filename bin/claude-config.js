@@ -7,6 +7,7 @@ import {
   changedMcpServers,
   mcpServersOf,
 } from './claude-config-drift.js';
+import { copyUnindexedPlugins } from './claude-config-plugins.js';
 
 // Prepares the isolated Claude Code config dir (CLAUDE_CONFIG_DIR) for a subc
 // launch. Isolation exists to stop one leak: a /model pick inside subc landing
@@ -390,6 +391,15 @@ function syncState(dir, home, written, warnings) {
   return mcpServersOf(next);
 }
 
+/** A JSON object, or `undefined` when missing or invalid; errors are reported elsewhere. */
+function readQuietly(file) {
+  try {
+    return readJsonObject(file);
+  } catch {
+    return undefined;
+  }
+}
+
 function readWritten(dir) {
   try {
     return readJsonObject(path.join(dir, WRITTEN_FILE)) ?? {};
@@ -426,6 +436,16 @@ export function prepareClaudeConfigDir({
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     shareEntries(dir, source, warnings);
     copyPluginIndex(dir, source, warnings);
+    copyUnindexedPlugins({
+      dir,
+      source,
+      enabledPlugins: readQuietly(path.join(source, 'settings.json'))
+        ?.enabledPlugins,
+      indexed: readQuietly(
+        path.join(source, 'plugins', 'installed_plugins.json'),
+      )?.plugins,
+      warnings,
+    });
     const written = readWritten(dir);
     const settings = rebuildSettings(
       dir,

@@ -604,3 +604,60 @@ test('a first launch with an existing subc dir reports nothing it cannot compare
   );
   assert.deepEqual(prepareClaudeConfigDir({ dir, home }).warnings, []);
 });
+
+test('an enabled plugin missing from the index is copied, never linked, into the subc cache', () => {
+  const { home, source, dir } = fakeHome({
+    settings: {
+      enabledPlugins: { 'v@m': true, 'off@m': false, '../x@m': true },
+    },
+  });
+  const version = path.join(source, 'plugins', 'cache', 'm', 'v', 'abc123');
+  fs.mkdirSync(path.join(version, '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(version, '.mcp.json'), '{"mcpServers":{}}');
+  fs.mkdirSync(path.join(source, 'plugins', 'cache', 'm', 'off', '1'), {
+    recursive: true,
+  });
+  const before = snapshot(source);
+
+  const { warnings } = prepareClaudeConfigDir({ dir, home });
+  assert.deepEqual(warnings, []);
+  const copy = path.join(dir, 'plugins', 'cache', 'm', 'v', 'abc123');
+  assert.equal(fs.lstatSync(copy).isSymbolicLink(), false);
+  assert.equal(
+    fs.readFileSync(path.join(copy, '.mcp.json'), 'utf8'),
+    '{"mcpServers":{}}',
+  );
+  assert.equal(
+    fs.existsSync(path.join(dir, 'plugins', 'cache', 'm', 'off')),
+    false,
+  );
+  assert.equal(fs.existsSync(path.join(dir, 'plugins', 'cache', 'x')), false);
+
+  // A session writing into its copy never reaches the user's plugin.
+  fs.writeFileSync(path.join(copy, '.orphaned_at'), 'now');
+  prepareClaudeConfigDir({ dir, home });
+  assert.deepEqual(snapshot(source), before);
+  assert.equal(
+    fs.existsSync(path.join(copy, '.orphaned_at')),
+    true,
+    'an existing copy is not redone',
+  );
+});
+
+test('a planted link in the subc plugin cache stops the copy', () => {
+  const { home, source, dir } = fakeHome({
+    settings: { enabledPlugins: { 'v@m': true } },
+  });
+  fs.mkdirSync(path.join(source, 'plugins', 'cache', 'm', 'v', 'abc'), {
+    recursive: true,
+  });
+  fs.mkdirSync(path.join(dir, 'plugins'), { recursive: true });
+  fs.symlinkSync(
+    path.join(source, 'plugins', 'cache'),
+    path.join(dir, 'plugins', 'cache'),
+  );
+  const before = snapshot(source);
+  const { warnings } = prepareClaudeConfigDir({ dir, home });
+  assert.match(warnings.join('\n'), /link/);
+  assert.deepEqual(snapshot(source), before);
+});
