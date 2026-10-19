@@ -562,6 +562,22 @@ function launchSource(inputEnv, dir, home, warnings) {
 }
 
 /**
+ * The Claude config folder plain `claude` uses: the source a subc launch
+ * shares from. `subc sessions` reads Claude sessions there.
+ *
+ * @param {{ env?: Record<string, string | undefined>, home?: string }} [options]
+ * @returns {string}
+ */
+export function claudeSourceDir({
+  env = process.env,
+  home = os.homedir(),
+} = {}) {
+  const subcBase =
+    env.SUBC_CONFIG_DIR?.trim() || path.join(home, '.subconscious');
+  return launchSource(env, path.join(subcBase, 'claude-code'), home, []).source;
+}
+
+/**
  * Prepare the subc config dir for a planned Claude Code launch. It shares
  * the folder the user's plain `claude` uses. An opted-out launch (no
  * CLAUDE_CONFIG_DIR) is left alone.
