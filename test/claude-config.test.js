@@ -618,7 +618,7 @@ test('a refused dir stops the launch', () => {
     agent,
     { CLAUDE_CONFIG_DIR: source },
     {},
-    { home },
+    { home, subcDir: source },
   );
   assert.equal(result.refused, true);
 });
@@ -791,4 +791,61 @@ test('links follow the source when it changes, and the old source is untouched',
   // A link to an entry the new source lacks is not left pointing at the old one.
   assert.equal(fs.existsSync(path.join(dir, 'CLAUDE.md')), false);
   assert.deepEqual(snapshot(source), before);
+});
+
+test('the opt-out never prepares, so a user-set dir is never treated as the subc dir', () => {
+  const agent = agentById('claude-code');
+  const { home } = fakeHome();
+  const own = customConfig(home);
+  fs.symlinkSync(path.join(own, 'skills'), path.join(home, 'skills-link'));
+  const before = snapshot(own);
+  const result = prepareClaudeLaunch(
+    agent,
+    { CLAUDE_CONFIG_DIR: own, CLAUDE_CODE_ISOLATE: 'off' },
+    { CLAUDE_CONFIG_DIR: own },
+    { home },
+  );
+  assert.deepEqual(result, { warnings: [], refused: false, env: {} });
+  assert.deepEqual(snapshot(own), before);
+});
+
+test('only the subc dir itself is ever prepared', () => {
+  const agent = agentById('claude-code');
+  const { home } = fakeHome();
+  const own = customConfig(home);
+  const before = snapshot(own);
+  // However the launch env came to point at the user's folder, it is not prepared.
+  const result = prepareClaudeLaunch(
+    agent,
+    { CLAUDE_CONFIG_DIR: own },
+    {},
+    { home },
+  );
+  assert.equal(result.refused, false);
+  assert.deepEqual(result.env, {});
+  assert.deepEqual(snapshot(own), before);
+});
+
+test('a source that is not a Claude config folder gets nothing created in it', () => {
+  const agent = agentById('claude-code');
+  const { home, source, dir } = fakeHome();
+  const typo = path.join(home, '.claude-wrk');
+  const repo = path.join(home, 'code-repo');
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  for (const own of [typo, repo]) {
+    const before = fs.existsSync(own) ? snapshot(own) : undefined;
+    const result = prepareClaudeLaunch(
+      agent,
+      { CLAUDE_CONFIG_DIR: dir },
+      { CLAUDE_CONFIG_DIR: own },
+      { home },
+    );
+    assert.match(result.warnings.join('\n'), /not a Claude config folder/, own);
+    assert.deepEqual(result.env, { SUBC_CLAUDE_CONFIG_SOURCE: source });
+    assert.deepEqual(
+      fs.existsSync(own) ? snapshot(own) : undefined,
+      before,
+      own,
+    );
+  }
 });

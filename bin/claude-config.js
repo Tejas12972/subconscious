@@ -8,6 +8,7 @@ import {
   mcpServersOf,
 } from './claude-config-drift.js';
 import { copyUnindexedPlugins } from './claude-config-plugins.js';
+import { configDir } from './profiles.js';
 
 // Prepares the isolated Claude Code config dir (CLAUDE_CONFIG_DIR) for a subc
 // launch. Isolation exists to stop one leak: a /model pick inside subc landing
@@ -484,6 +485,20 @@ export function prepareClaudeConfigDir({
 // its shell now has as CLAUDE_CONFIG_DIR.
 const SOURCE_ENV = 'SUBC_CLAUDE_CONFIG_SOURCE';
 
+// CLAUDE_CODE_ISOLATE values that opt out; the launch runs on the user's
+// own folder and nothing is prepared.
+const ISOLATE_OFF = new Set(['off', '0', 'false', 'no']);
+
+/**
+ * Whether `folder` is a Claude config folder Claude Code has used: a typo or
+ * a code repo would otherwise get shared folders created in it.
+ */
+function looksLikeClaudeConfig(folder) {
+  return ['settings.json', '.claude.json', 'projects'].some((name) =>
+    fs.existsSync(path.join(folder, name)),
+  );
+}
+
 /**
  * The user's own Claude config folder for a launch: the one carried from an
  * outer subc session, else their CLAUDE_CONFIG_DIR, else ~/.claude. The subc
@@ -505,6 +520,12 @@ function launchSource(inputEnv, dir, home, warnings) {
     }
     if (identity(value) && identity(value) === identity(dir)) continue;
     if (path.resolve(value) === path.resolve(dir)) continue;
+    if (!looksLikeClaudeConfig(value)) {
+      warnings.push(
+        `${name}=${value} is not a Claude config folder, so subc sessions share ~/.claude instead.`,
+      );
+      return fallback;
+    }
     return { source: value, stateFile: path.join(value, '.claude.json') };
   }
   return fallback;
@@ -518,14 +539,27 @@ function launchSource(inputEnv, dir, home, warnings) {
  * @param {{ env: { name: string }[] }} agent
  * @param {Record<string, string | undefined>} launchEnv the planned launch env
  * @param {Record<string, string | undefined>} inputEnv the env before planning
- * @param {{ home?: string }} [options]
+ * @param {{ home?: string, subcDir?: string }} [options] `subcDir` is the
+ *   subc config dir; it defaults to $SUBC_CONFIG_DIR/claude-code
  * @returns {{ warnings: string[], refused: boolean,
  *   env: Record<string, string> }} `env` goes into the launch env
  */
 export function prepareClaudeLaunch(agent, launchEnv, inputEnv, options = {}) {
+  const none = { warnings: [], refused: false, env: {} };
   const dir = launchEnv.CLAUDE_CONFIG_DIR?.trim();
-  if (!dir) return { warnings: [], refused: false, env: {} };
+  if (!dir) return none;
+  const isolate = String(launchEnv.CLAUDE_CODE_ISOLATE ?? '')
+    .trim()
+    .toLowerCase();
+  // Opted out: CLAUDE_CONFIG_DIR is the user's own folder.
+  if (ISOLATE_OFF.has(isolate)) return none;
   const home = options.home ?? os.homedir();
+  // Only the subc dir itself is ever prepared, whatever the launch env says.
+  const subcBase =
+    launchEnv.SUBC_CONFIG_DIR?.trim() ||
+    (options.home ? path.join(home, '.subconscious') : configDir());
+  const subcDir = options.subcDir ?? path.join(subcBase, 'claude-code');
+  if (path.resolve(dir) !== path.resolve(subcDir)) return none;
   const warnings = [];
   const { source, stateFile } = launchSource(inputEnv, dir, home, warnings);
   const launchEnvNames = agent.env.map((entry) => entry.name);
