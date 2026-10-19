@@ -2,6 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {
+  changedKeys,
+  changedMcpServers,
+  mcpServersOf,
+} from './claude-config-drift.js';
 
 // Prepares the isolated Claude Code config dir (CLAUDE_CONFIG_DIR) for a subc
 // launch. Isolation exists to stop one leak: a /model pick inside subc landing
@@ -13,13 +18,12 @@ import path from 'node:path';
 // own Claude Code reads. It writes only inside the isolated dir, and refuses a
 // dir that resolves to ~/.claude, into it, or to a folder that holds it.
 
-/**
- * Entries of ~/.claude that subc sessions share through a link: the user's
- * memory, rules, skills and hooks, plus session history so resume and `subc`
- * session lists see one set of sessions.
- */
-export const SHARED_ENTRIES = Object.freeze([
-  'CLAUDE.md',
+// Folders of ~/.claude that subc sessions share through a link: the user's
+// rules, skills and hooks, session history so resume and `subc` session lists
+// see one set of sessions, and the editor lock files so /ide finds the editor.
+// A missing one is created in ~/.claude first, so something made inside subc
+// (a first agent, a first skill) still lands in ~/.claude.
+const SHARED_DIRS = [
   'rules',
   'agents',
   'commands',
@@ -27,14 +31,21 @@ export const SHARED_ENTRIES = Object.freeze([
   'output-styles',
   'hooks',
   'projects',
-  'history.jsonl',
   'file-history',
   'todos',
   'plans',
-]);
+  'ide',
+];
 
-// Linked even when ~/.claude lacks them, so sessions are shared from the start.
-const ALWAYS_SHARED_DIRS = new Set(['projects']);
+// Files of ~/.claude shared through a link when the user has them.
+const SHARED_FILES = ['CLAUDE.md', 'history.jsonl', 'keybindings.json'];
+
+/** Every entry of ~/.claude that subc sessions share through a link. */
+export const SHARED_ENTRIES = Object.freeze([...SHARED_FILES, ...SHARED_DIRS]);
+
+// What the last launch wrote into the subc copies, to find what a session
+// changed there before the next rebuild replaces it.
+const WRITTEN_FILE = '.subc-written.json';
 
 // Plugin index files copied into the subc plugins dir on each launch. The
 // install paths inside still point at ~/.claude/plugins/cache, which Claude
@@ -242,7 +253,7 @@ function linkEntry(target, link) {
 function shareEntry(dir, source, name, warnings) {
   const target = path.join(source, name);
   const link = path.join(dir, name);
-  if (ALWAYS_SHARED_DIRS.has(name) && !fs.existsSync(target)) {
+  if (SHARED_DIRS.includes(name) && !fs.existsSync(target)) {
     fs.mkdirSync(target, { recursive: true });
   }
   if (!fs.existsSync(target)) return;
@@ -292,7 +303,7 @@ function copyPluginIndex(dir, source, warnings) {
   }
 }
 
-function rebuildSettings(dir, source, launchEnvNames, warnings) {
+function rebuildSettings(dir, source, launchEnvNames, written, warnings) {
   const file = path.join(dir, 'settings.json');
   let user = {};
   try {
@@ -319,7 +330,19 @@ function rebuildSettings(dir, source, launchEnvNames, warnings) {
     if (Object.keys(env).length) settings.env = env;
     else delete settings.env;
   }
-  writeJsonAtomic(file, { ...settings, ...pick(current, SUBC_OWNED_SETTINGS) });
+  const lost = written
+    ? changedKeys(written, current, SUBC_OWNED_SETTINGS)
+    : [];
+  if (lost.length) {
+    const saved = path.join(dir, 'settings.discarded.json');
+    writeJsonAtomic(saved, current, 0o600);
+    warnings.push(
+      `Settings changed inside your last subc session are not kept: ${lost.join(', ')}. They are saved in ${saved}. To keep them, add them in plain claude or ~/.claude/settings.json.`,
+    );
+  }
+  const next = { ...settings, ...pick(current, SUBC_OWNED_SETTINGS) };
+  writeJsonAtomic(file, next);
+  return next;
 }
 
 function mergeProjects(current, user) {
@@ -334,7 +357,7 @@ function mergeProjects(current, user) {
   return projects;
 }
 
-function syncState(dir, home, warnings) {
+function syncState(dir, home, written, warnings) {
   const file = path.join(dir, '.claude.json');
   let user;
   let current;
@@ -342,20 +365,37 @@ function syncState(dir, home, warnings) {
     user = readJsonObject(path.join(home, '.claude.json'));
   } catch (error) {
     warnings.push(`Ignored ~/.claude.json in subc sessions: ${error.message}`);
-    return;
+    return undefined;
   }
-  if (!user) return;
+  if (!user) return undefined;
   try {
     current = readJsonObject(file) ?? {};
   } catch (error) {
     warnings.push(`Left ${file} unchanged: ${error.message}`);
-    return;
+    return undefined;
+  }
+  const lost = written ? changedMcpServers(written, mcpServersOf(current)) : [];
+  if (lost.length) {
+    const saved = path.join(dir, 'mcp.discarded.json');
+    writeJsonAtomic(saved, mcpServersOf(current), 0o600);
+    warnings.push(
+      `MCP servers added inside your last subc session are not kept: ${lost.join(', ')}. They are saved in ${saved}. To keep them, add them in plain claude.`,
+    );
   }
   const next = { ...current, ...pick(user, COPIED_STATE) };
   if (isObject(user.projects)) {
     next.projects = mergeProjects(current.projects, user.projects);
   }
   writeJsonAtomic(file, next, 0o600);
+  return mcpServersOf(next);
+}
+
+function readWritten(dir) {
+  try {
+    return readJsonObject(path.join(dir, WRITTEN_FILE)) ?? {};
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -386,8 +426,16 @@ export function prepareClaudeConfigDir({
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     shareEntries(dir, source, warnings);
     copyPluginIndex(dir, source, warnings);
-    rebuildSettings(dir, source, new Set(launchEnvNames), warnings);
-    syncState(dir, home, warnings);
+    const written = readWritten(dir);
+    const settings = rebuildSettings(
+      dir,
+      source,
+      new Set(launchEnvNames),
+      written.settings,
+      warnings,
+    );
+    const mcp = syncState(dir, home, written.mcp, warnings);
+    writeJsonAtomic(path.join(dir, WRITTEN_FILE), { settings, mcp }, 0o600);
   } catch (error) {
     warnings.push(
       `Could not prepare the subc Claude config dir ${dir}: ${error.message}`,

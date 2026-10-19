@@ -89,8 +89,21 @@ test('shared entries link back to ~/.claude, so the user setup and sessions are 
     path.join(source, 'projects'),
   );
   assert.equal(fs.statSync(path.join(source, 'projects')).isDirectory(), true);
-  // An entry the user does not have is not invented.
-  assert.equal(fs.existsSync(path.join(dir, 'agents')), false);
+  // A shared folder the user lacks is created in ~/.claude first, so the
+  // first agent made inside subc still lands in ~/.claude.
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'agents')),
+    path.join(source, 'agents'),
+  );
+  assert.equal(fs.statSync(path.join(source, 'agents')).isDirectory(), true);
+  // The editor lock files are shared, so /ide finds the editor.
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'ide')),
+    path.join(source, 'ide'),
+  );
+  // A shared file the user lacks is not invented.
+  assert.equal(fs.existsSync(path.join(source, 'keybindings.json')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'keybindings.json')), false);
 
   // A session written through the isolated dir lands in ~/.claude.
   fs.writeFileSync(path.join(dir, 'projects', 's.jsonl'), '{}');
@@ -503,4 +516,91 @@ test('a refused dir stops the launch', () => {
     { home },
   );
   assert.equal(result.refused, true);
+});
+
+test('keyboard shortcuts are shared when the user has them', () => {
+  const { home, source, dir } = fakeHome();
+  fs.writeFileSync(path.join(source, 'keybindings.json'), '{"bindings":[]}');
+  prepareClaudeConfigDir({ dir, home });
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'keybindings.json')),
+    path.join(source, 'keybindings.json'),
+  );
+});
+
+test('settings changed inside subc are saved aside and named before the next launch replaces them', () => {
+  const { home, source, dir } = fakeHome({
+    settings: { hooks: {}, permissions: { allow: ['Bash'] }, theme: 'dark' },
+  });
+  const userBefore = fs.readFileSync(path.join(source, 'settings.json'));
+  let result = prepareClaudeConfigDir({ dir, home });
+  assert.deepEqual(result.warnings, []);
+
+  // Inside the session: a hook and a permission change, a /model pick, and a
+  // key Claude Code itself removed.
+  const file = path.join(dir, 'settings.json');
+  const edited = {
+    hooks: { Stop: [{ hooks: [{ type: 'command', command: 'say done' }] }] },
+    permissions: { allow: ['Bash', 'Read'] },
+    model: 'subconscious/glm',
+  };
+  fs.writeFileSync(file, JSON.stringify(edited));
+
+  result = prepareClaudeConfigDir({ dir, home });
+  const warning = result.warnings.join('\n');
+  assert.match(warning, /hooks/);
+  assert.match(warning, /permissions/);
+  assert.doesNotMatch(warning, /model/, 'the model pick is kept, not lost');
+  assert.doesNotMatch(warning, /theme/, 'a removed key is not reported');
+  const saved = readJson(path.join(dir, 'settings.discarded.json'));
+  assert.deepEqual(saved, edited);
+  assert.match(warning, /settings\.discarded\.json/);
+  if (process.platform !== 'win32') {
+    assert.equal(
+      fs.statSync(path.join(dir, 'settings.discarded.json')).mode & 0o777,
+      0o600,
+    );
+  }
+  assert.deepEqual(
+    fs.readFileSync(path.join(source, 'settings.json')),
+    userBefore,
+  );
+
+  // Nothing changed since: no warning.
+  assert.deepEqual(prepareClaudeConfigDir({ dir, home }).warnings, []);
+});
+
+test('MCP servers added inside subc are saved aside and named', () => {
+  const { home, dir } = fakeHome();
+  prepareClaudeConfigDir({ dir, home });
+  const file = path.join(dir, '.claude.json');
+  const state = readJson(file);
+  state.mcpServers = {
+    ...state.mcpServers,
+    notion: { type: 'http', url: 'https://n' },
+  };
+  state.projects['/work/app'].mcpServers = {
+    db: { command: 'db-mcp' },
+    pg: { command: 'pg' },
+  };
+  state.numStartups = 99;
+  fs.writeFileSync(file, JSON.stringify(state));
+
+  const warning = prepareClaudeConfigDir({ dir, home }).warnings.join('\n');
+  assert.match(warning, /notion/);
+  assert.match(warning, /pg/);
+  assert.doesNotMatch(warning, /linear|db-mcp|numStartups/);
+  const saved = readJson(path.join(dir, 'mcp.discarded.json'));
+  assert.deepEqual(saved.mcpServers.notion, { type: 'http', url: 'https://n' });
+  assert.deepEqual(prepareClaudeConfigDir({ dir, home }).warnings, []);
+});
+
+test('a first launch with an existing subc dir reports nothing it cannot compare', () => {
+  const { home, dir } = fakeHome();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'settings.json'),
+    JSON.stringify({ hooks: { x: 1 } }),
+  );
+  assert.deepEqual(prepareClaudeConfigDir({ dir, home }).warnings, []);
 });
