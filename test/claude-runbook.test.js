@@ -119,8 +119,21 @@ test('Claude launch points Claude Code at the isolated subc config dir', async (
   assert.equal(own.status, 0, own.stderr);
   assert.equal(
     own.stdout,
+    path.join(subcConfig, 'claude-code'),
+    'a user-set CLAUDE_CONFIG_DIR is the source subc shares from, not the launch dir',
+  );
+
+  const ownOptOut = runSync(
+    launchCommand('claude-code', {
+      env: { ...shellEnv, ...base, CLAUDE_CONFIG_DIR: '/custom/claude' },
+      args: ['--no-isolate'],
+    }),
+  );
+  assert.equal(ownOptOut.status, 0, ownOptOut.stderr);
+  assert.equal(
+    ownOptOut.stdout,
     '/custom/claude',
-    'a user-set CLAUDE_CONFIG_DIR must win over the isolated dir',
+    '--no-isolate must keep the user-set CLAUDE_CONFIG_DIR',
   );
 });
 

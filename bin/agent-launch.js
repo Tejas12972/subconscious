@@ -31,7 +31,12 @@ function tokensFor(agent, env, extra) {
       const setting = String(env.CLAUDE_CODE_ISOLATE ?? '')
         .trim()
         .toLowerCase();
-      if (ISOLATE_OFF.has(setting)) return '';
+      // Opted out: the user's own folder, as plain `claude` would use it.
+      if (ISOLATE_OFF.has(setting)) {
+        return String(
+          env.SUBC_CLAUDE_CONFIG_SOURCE || env.CLAUDE_CONFIG_DIR || '',
+        ).trim();
+      }
       const base = String(env.SUBC_CONFIG_DIR ?? '').trim() || configDir();
       // A relative base would put the config, MCP tokens included, in the
       // current directory; use ~/.claude unchanged instead.

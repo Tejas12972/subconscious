@@ -272,23 +272,127 @@ test('SHARED_ENTRIES never includes the files subc rebuilds', () => {
   }
 });
 
-test('a launch prepares only the dir subc chose', () => {
+/** A second Claude config folder, as CLAUDE_CONFIG_DIR users keep one. */
+function customConfig(home, name = '.claude-personal') {
+  const own = path.join(home, name);
+  fs.mkdirSync(path.join(own, 'skills', 'personal-skill'), { recursive: true });
+  fs.writeFileSync(
+    path.join(own, 'settings.json'),
+    JSON.stringify({ model: 'opus', hooks: { Own: [] } }),
+  );
+  fs.writeFileSync(
+    path.join(own, '.claude.json'),
+    JSON.stringify({
+      mcpServers: { notion: { type: 'http', url: 'https://n' } },
+      oauthAccount: { x: 1 },
+    }),
+  );
+  return own;
+}
+
+test('a launch prepares the dir subc chose and skips an opted-out launch', () => {
   const agent = agentById('claude-code');
   const { home, dir } = fakeHome();
-
   prepareClaudeLaunch(agent, {}, {}, { home });
   assert.equal(fs.existsSync(dir), false, 'opted out: nothing to prepare');
+  prepareClaudeLaunch(agent, { CLAUDE_CONFIG_DIR: dir }, {}, { home });
+  assert.equal(fs.lstatSync(path.join(dir, 'skills')).isSymbolicLink(), true);
+});
 
-  prepareClaudeLaunch(
+test('a user-set CLAUDE_CONFIG_DIR is the source subc shares from', () => {
+  const agent = agentById('claude-code');
+  const { home, source, dir } = fakeHome();
+  const own = customConfig(home);
+  const before = { claude: snapshot(source), own: snapshot(own) };
+
+  const result = prepareClaudeLaunch(
+    agent,
+    { CLAUDE_CONFIG_DIR: dir },
+    { CLAUDE_CONFIG_DIR: own },
+    { home },
+  );
+  assert.equal(result.refused, false);
+  assert.deepEqual(result.env, { SUBC_CLAUDE_CONFIG_SOURCE: own });
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'skills')),
+    path.join(own, 'skills'),
+  );
+  assert.deepEqual(readJson(path.join(dir, 'settings.json')), {
+    hooks: { Own: [] },
+  });
+  const state = readJson(path.join(dir, '.claude.json'));
+  assert.deepEqual(
+    Object.keys(state.mcpServers),
+    ['notion'],
+    'MCP servers come from $CLAUDE_CONFIG_DIR/.claude.json',
+  );
+  assert.equal(state.oauthAccount, undefined);
+  assert.deepEqual({ claude: snapshot(source), own: snapshot(own) }, before);
+});
+
+test('a subc session started inside a subc session keeps the original source', () => {
+  const agent = agentById('claude-code');
+  const { home, source, dir } = fakeHome();
+  const own = customConfig(home);
+  // The inner shell carries the subc dir as CLAUDE_CONFIG_DIR.
+  const inner = { CLAUDE_CONFIG_DIR: dir, SUBC_CLAUDE_CONFIG_SOURCE: own };
+  const result = prepareClaudeLaunch(agent, { CLAUDE_CONFIG_DIR: dir }, inner, {
+    home,
+  });
+  assert.equal(result.refused, false);
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'skills')),
+    path.join(own, 'skills'),
+  );
+
+  // Without the carried source, the subc dir is never its own source.
+  const bare = prepareClaudeLaunch(
     agent,
     { CLAUDE_CONFIG_DIR: dir },
     { CLAUDE_CONFIG_DIR: dir },
     { home },
   );
-  assert.equal(fs.existsSync(dir), false, "a user-set dir is the user's own");
+  assert.equal(bare.refused, false);
+  assert.deepEqual(bare.env, { SUBC_CLAUDE_CONFIG_SOURCE: source });
+});
 
-  prepareClaudeLaunch(agent, { CLAUDE_CONFIG_DIR: dir }, {}, { home });
-  assert.equal(fs.lstatSync(path.join(dir, 'skills')).isSymbolicLink(), true);
+test('a relative CLAUDE_CONFIG_DIR falls back to ~/.claude with a warning', () => {
+  const agent = agentById('claude-code');
+  const { home, source, dir } = fakeHome();
+  const result = prepareClaudeLaunch(
+    agent,
+    { CLAUDE_CONFIG_DIR: dir },
+    { CLAUDE_CONFIG_DIR: 'rel/claude' },
+    { home },
+  );
+  assert.match(result.warnings.join('\n'), /not an absolute path/);
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'skills')),
+    path.join(source, 'skills'),
+  );
+});
+
+test('a source that resolves to the subc dir or holds it is refused', () => {
+  const { home, dir } = fakeHome();
+  const own = customConfig(home);
+  for (const target of [own, path.join(own, 'sub')]) {
+    const { refused } = prepareClaudeConfigDir({
+      dir: target,
+      home,
+      source: own,
+      stateFile: path.join(own, '.claude.json'),
+    });
+    assert.equal(refused, true, target);
+  }
+  assert.equal(
+    prepareClaudeConfigDir({
+      dir,
+      home,
+      source: own,
+      stateFile: path.join(own, '.claude.json'),
+    }).refused,
+    false,
+  );
 });
 
 test('the launch env subc sets wins over the user settings env', () => {
@@ -336,6 +440,7 @@ test('a blank config dir never reaches prepare', () => {
     assert.deepEqual(prepareClaudeLaunch(agent, blank, blank, { home }), {
       warnings: [],
       refused: false,
+      env: {},
     });
     assert.deepEqual(fs.readdirSync(cwd), []);
   });
@@ -659,5 +764,31 @@ test('a planted link in the subc plugin cache stops the copy', () => {
   const before = snapshot(source);
   const { warnings } = prepareClaudeConfigDir({ dir, home });
   assert.match(warnings.join('\n'), /link/);
+  assert.deepEqual(snapshot(source), before);
+});
+
+test('links follow the source when it changes, and the old source is untouched', () => {
+  const agent = agentById('claude-code');
+  const { home, source, dir } = fakeHome();
+  prepareClaudeLaunch(agent, { CLAUDE_CONFIG_DIR: dir }, {}, { home });
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'skills')),
+    path.join(source, 'skills'),
+  );
+  const before = snapshot(source);
+
+  const own = customConfig(home);
+  prepareClaudeLaunch(
+    agent,
+    { CLAUDE_CONFIG_DIR: dir },
+    { CLAUDE_CONFIG_DIR: own },
+    { home },
+  );
+  assert.equal(
+    fs.readlinkSync(path.join(dir, 'skills')),
+    path.join(own, 'skills'),
+  );
+  // A link to an entry the new source lacks is not left pointing at the old one.
+  assert.equal(fs.existsSync(path.join(dir, 'CLAUDE.md')), false);
   assert.deepEqual(snapshot(source), before);
 });

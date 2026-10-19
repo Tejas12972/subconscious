@@ -282,10 +282,9 @@ export async function executeWindowsLaunch(spec, run, prepareOptions) {
     }
     // Claude Code would write into the user's own config there.
     if (prepared?.refused) return 1;
+    const env = { ...spec.env, ...prepared?.env };
     const options =
-      spec.input === undefined
-        ? { env: spec.env }
-        : { env: spec.env, input: spec.input };
+      spec.input === undefined ? { env } : { env, input: spec.input };
     return await run(spec.command, spec.args, options);
   } finally {
     await spec.cleanup?.();

@@ -180,12 +180,12 @@ function selfAndAncestors(file) {
 // with the path in the subc dir that prepare writes.
 // A plugins link from an earlier build is unlinked, never written through,
 // before the plugin files are written, so its target needs no check.
-function guardedWrites(dir, home, source) {
+function guardedWrites(dir, source, stateFile) {
   const pluginsLink = lstatOrUndefined(path.join(dir, 'plugins'));
   const plugins = pluginsLink?.isSymbolicLink() ? [] : PLUGIN_INDEX_FILES;
   return [
     [path.join(source, 'settings.json'), path.join(dir, 'settings.json')],
-    [path.join(home, '.claude.json'), path.join(dir, '.claude.json')],
+    [stateFile, path.join(dir, '.claude.json')],
     ...plugins.map((name) => [
       path.join(source, 'plugins', name),
       path.join(dir, 'plugins', name),
@@ -198,27 +198,25 @@ function guardedWrites(dir, home, source) {
  * file identities, not path text, so no spelling, case or link can alias the
  * user's config into the dir.
  */
-function unsafeDirReason(dir, home, source) {
+function unsafeDirReason(dir, source, stateFile) {
   if (!path.isAbsolute(dir)) return `${dir} is not an absolute path`;
   const sourceId = identity(source);
   if (sourceId && selfAndAncestors(dir).has(sourceId)) {
-    return `${dir} resolves into ~/.claude`;
+    return `${dir} resolves into your Claude config ${source}`;
   }
   const dirIds = selfAndAncestors(dir);
   for (const name of [...SHARED_ENTRIES, 'plugins']) {
     const targetId = identity(path.join(source, name));
     if (targetId && dirIds.has(targetId)) {
-      return `${dir} resolves into the folder behind ~/.claude/${name}`;
+      return `${dir} resolves into the folder behind ${path.join(source, name)}`;
     }
   }
   const dirId = identity(dir);
-  const homeJson = identity(
-    path.dirname(realPath(path.join(home, '.claude.json'))),
-  );
+  const homeJson = identity(path.dirname(realPath(stateFile)));
   if (dirId && (selfAndAncestors(source).has(dirId) || dirId === homeJson)) {
     return `${dir} resolves to a folder that holds your Claude config`;
   }
-  for (const [user, own] of guardedWrites(dir, home, source)) {
+  for (const [user, own] of guardedWrites(dir, source, stateFile)) {
     const userId = identity(user);
     // A link at `own` is replaced by the rename, never written through.
     if (lstatOrUndefined(own)?.isSymbolicLink()) continue;
@@ -254,17 +252,26 @@ function linkEntry(target, link) {
 function shareEntry(dir, source, name, warnings) {
   const target = path.join(source, name);
   const link = path.join(dir, name);
+  let existing = lstatOrUndefined(link);
+  // A link from an earlier launch can point at another source. Removing a
+  // link never touches its target.
+  if (
+    existing?.isSymbolicLink() &&
+    path.resolve(dir, fs.readlinkSync(link)) !== path.resolve(target)
+  ) {
+    fs.unlinkSync(link);
+    existing = undefined;
+  }
   if (SHARED_DIRS.includes(name) && !fs.existsSync(target)) {
     fs.mkdirSync(target, { recursive: true });
   }
   if (!fs.existsSync(target)) return;
-  const existing = lstatOrUndefined(link);
   if (existing?.isSymbolicLink() || (existing && sameFile(link, target))) {
     return;
   }
   if (existing) {
     warnings.push(
-      `${link} is a real ${existing.isDirectory() ? 'directory' : 'file'}, so subc sessions do not share ~/.claude/${name}; move it aside to share it.`,
+      `${link} is a real ${existing.isDirectory() ? 'directory' : 'file'}, so subc sessions do not share ${target}; move it aside to share it.`,
     );
     return;
   }
@@ -276,7 +283,9 @@ function shareEntries(dir, source, warnings) {
     try {
       shareEntry(dir, source, name, warnings);
     } catch (error) {
-      warnings.push(`Could not share ~/.claude/${name}: ${error.message}`);
+      warnings.push(
+        `Could not share ${path.join(source, name)}: ${error.message}`,
+      );
     }
   }
 }
@@ -298,7 +307,7 @@ function copyPluginIndex(dir, source, warnings) {
       if (text !== undefined) writeAtomic(path.join(own, name), text, 0o600);
     } catch (error) {
       warnings.push(
-        `Could not copy ~/.claude/plugins/${name}: ${error.message}`,
+        `Could not copy ${path.join(source, 'plugins', name)}: ${error.message}`,
       );
     }
   }
@@ -311,7 +320,7 @@ function rebuildSettings(dir, source, launchEnvNames, written, warnings) {
     user = readJsonObject(path.join(source, 'settings.json')) ?? {};
   } catch (error) {
     warnings.push(
-      `Ignored ~/.claude/settings.json in subc sessions: ${error.message}`,
+      `Ignored ${path.join(source, 'settings.json')} in subc sessions: ${error.message}`,
     );
   }
   let current = {};
@@ -338,7 +347,7 @@ function rebuildSettings(dir, source, launchEnvNames, written, warnings) {
     const saved = path.join(dir, 'settings.discarded.json');
     writeJsonAtomic(saved, current, 0o600);
     warnings.push(
-      `Settings changed inside your last subc session are not kept: ${lost.join(', ')}. They are saved in ${saved}. To keep them, add them in plain claude or ~/.claude/settings.json.`,
+      `Settings changed inside your last subc session are not kept: ${lost.join(', ')}. They are saved in ${saved}. To keep them, add them in plain claude.`,
     );
   }
   const next = { ...settings, ...pick(current, SUBC_OWNED_SETTINGS) };
@@ -358,14 +367,14 @@ function mergeProjects(current, user) {
   return projects;
 }
 
-function syncState(dir, home, written, warnings) {
+function syncState(dir, stateFile, written, warnings) {
   const file = path.join(dir, '.claude.json');
   let user;
   let current;
   try {
-    user = readJsonObject(path.join(home, '.claude.json'));
+    user = readJsonObject(stateFile);
   } catch (error) {
-    warnings.push(`Ignored ~/.claude.json in subc sessions: ${error.message}`);
+    warnings.push(`Ignored ${stateFile} in subc sessions: ${error.message}`);
     return undefined;
   }
   if (!user) return undefined;
@@ -414,18 +423,24 @@ function readWritten(dir) {
  * to create ~/.claude/projects, and never deletes anything there. Problems
  * come back as warnings; preparing never throws, so a launch always proceeds.
  *
- * @param {{ dir: string, home?: string, launchEnvNames?: Iterable<string> }} options
+ * `source` is the user's own Claude config folder (~/.claude, or their
+ * CLAUDE_CONFIG_DIR) and `stateFile` its .claude.json (~/.claude.json, or
+ * .claude.json inside their CLAUDE_CONFIG_DIR).
+ *
+ * @param {{ dir: string, home?: string, source?: string, stateFile?: string,
+ *   launchEnvNames?: Iterable<string> }} options
  * @returns {{ warnings: string[], refused: boolean }} `refused` means the
  *   dir aliases the user's own config; the launch must not run on it.
  */
 export function prepareClaudeConfigDir({
   dir,
   home = os.homedir(),
+  source = path.join(home, '.claude'),
+  stateFile = path.join(home, '.claude.json'),
   launchEnvNames = [],
 }) {
   const warnings = [];
-  const source = path.join(home, '.claude');
-  const unsafe = unsafeDirReason(dir, home, source);
+  const unsafe = unsafeDirReason(dir, source, stateFile);
   if (unsafe) {
     warnings.push(
       `Refused to use ${dir} as the subc Claude config dir: ${unsafe}. Claude Code would write into your own config there. Point SUBC_CONFIG_DIR somewhere else, or run subc claude --no-isolate.`,
@@ -454,7 +469,7 @@ export function prepareClaudeConfigDir({
       written.settings,
       warnings,
     );
-    const mcp = syncState(dir, home, written.mcp, warnings);
+    const mcp = syncState(dir, stateFile, written.mcp, warnings);
     writeJsonAtomic(path.join(dir, WRITTEN_FILE), { settings, mcp }, 0o600);
   } catch (error) {
     warnings.push(
@@ -464,23 +479,66 @@ export function prepareClaudeConfigDir({
   return { warnings, refused: false };
 }
 
+// Carries the user's own config folder into a subc session, so a `subc
+// claude` started inside it shares from that folder, not from the subc dir
+// its shell now has as CLAUDE_CONFIG_DIR.
+const SOURCE_ENV = 'SUBC_CLAUDE_CONFIG_SOURCE';
+
 /**
- * Prepare the isolated dir for a planned Claude Code launch, when subc chose
- * it. A CLAUDE_CONFIG_DIR the user set themselves (in `inputEnv`, even blank)
- * and an opted-out launch (no CLAUDE_CONFIG_DIR) are left alone.
+ * The user's own Claude config folder for a launch: the one carried from an
+ * outer subc session, else their CLAUDE_CONFIG_DIR, else ~/.claude. The subc
+ * dir itself is never a source.
+ */
+function launchSource(inputEnv, dir, home, warnings) {
+  const fallback = {
+    source: path.join(home, '.claude'),
+    stateFile: path.join(home, '.claude.json'),
+  };
+  for (const name of [SOURCE_ENV, 'CLAUDE_CONFIG_DIR']) {
+    const value = inputEnv[name]?.trim();
+    if (!value) continue;
+    if (!path.isAbsolute(value)) {
+      warnings.push(
+        `${name}=${value} is not an absolute path, so subc sessions share ~/.claude instead.`,
+      );
+      return fallback;
+    }
+    if (identity(value) && identity(value) === identity(dir)) continue;
+    if (path.resolve(value) === path.resolve(dir)) continue;
+    return { source: value, stateFile: path.join(value, '.claude.json') };
+  }
+  return fallback;
+}
+
+/**
+ * Prepare the subc config dir for a planned Claude Code launch. It shares
+ * the folder the user's plain `claude` uses. An opted-out launch (no
+ * CLAUDE_CONFIG_DIR) is left alone.
  *
  * @param {{ env: { name: string }[] }} agent
  * @param {Record<string, string | undefined>} launchEnv the planned launch env
  * @param {Record<string, string | undefined>} inputEnv the env before planning
  * @param {{ home?: string }} [options]
- * @returns {{ warnings: string[], refused: boolean }}
+ * @returns {{ warnings: string[], refused: boolean,
+ *   env: Record<string, string> }} `env` goes into the launch env
  */
 export function prepareClaudeLaunch(agent, launchEnv, inputEnv, options = {}) {
-  const dir = launchEnv.CLAUDE_CONFIG_DIR;
-  const own = inputEnv.CLAUDE_CONFIG_DIR;
-  if (!dir || (own !== undefined && own !== '')) {
-    return { warnings: [], refused: false };
-  }
+  const dir = launchEnv.CLAUDE_CONFIG_DIR?.trim();
+  if (!dir) return { warnings: [], refused: false, env: {} };
+  const home = options.home ?? os.homedir();
+  const warnings = [];
+  const { source, stateFile } = launchSource(inputEnv, dir, home, warnings);
   const launchEnvNames = agent.env.map((entry) => entry.name);
-  return prepareClaudeConfigDir({ dir, launchEnvNames, ...options });
+  const prepared = prepareClaudeConfigDir({
+    dir,
+    home,
+    source,
+    stateFile,
+    launchEnvNames,
+  });
+  return {
+    warnings: [...warnings, ...prepared.warnings],
+    refused: prepared.refused,
+    env: { [SOURCE_ENV]: source },
+  };
 }
