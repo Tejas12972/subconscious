@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,12 +7,16 @@ import path from 'node:path';
 // launch. Isolation exists to stop one leak: a /model pick inside subc landing
 // in ~/.claude/settings.json and changing plain `claude`. Everything else the
 // user set up in ~/.claude must keep working inside subc, so this dir links
-// back to it and rebuilds the two files Claude Code keeps per config dir.
+// back to it and rebuilds the files Claude Code keeps per config dir.
+//
+// The one rule: preparing never writes, moves or deletes anything the user's
+// own Claude Code reads. It writes only inside the isolated dir, and refuses a
+// dir that resolves to ~/.claude, into it, or to a folder that holds it.
 
 /**
  * Entries of ~/.claude that subc sessions share through a link: the user's
- * memory, rules, skills, plugins and hooks, plus session history so resume
- * and `subc` session lists see one set of sessions.
+ * memory, rules, skills and hooks, plus session history so resume and `subc`
+ * session lists see one set of sessions.
  */
 export const SHARED_ENTRIES = Object.freeze([
   'CLAUDE.md',
@@ -19,7 +24,6 @@ export const SHARED_ENTRIES = Object.freeze([
   'agents',
   'commands',
   'skills',
-  'plugins',
   'output-styles',
   'hooks',
   'projects',
@@ -31,6 +35,18 @@ export const SHARED_ENTRIES = Object.freeze([
 
 // Linked even when ~/.claude lacks them, so sessions are shared from the start.
 const ALWAYS_SHARED_DIRS = new Set(['projects']);
+
+// Plugin index files copied into the subc plugins dir on each launch. The
+// install paths inside still point at ~/.claude/plugins/cache, which Claude
+// Code treats as outside its own cache root: a subc session can load those
+// plugins but never marks them orphaned or deletes them. The cache itself is
+// never linked, so an uninstall or cache sweep in subc cannot reach it.
+const PLUGIN_INDEX_FILES = [
+  'installed_plugins.json',
+  'known_marketplaces.json',
+  'blocklist.json',
+  'config.json',
+];
 
 // User settings keys subc owns inside its sessions. `model` is the leak this
 // isolation exists for; the subc value survives each rebuild.
@@ -54,28 +70,161 @@ const isObject = (value) =>
 
 function pick(source, keys) {
   return Object.fromEntries(
-    keys.filter((key) => key in source).map((key) => [key, source[key]]),
+    keys
+      .filter((key) => Object.hasOwn(source, key))
+      .map((key) => [key, source[key]]),
   );
 }
 
-/** Parsed JSON object, `undefined` when the file is missing; throws when invalid. */
-function readJsonObject(file) {
-  let text;
+/** Text of a regular file (links followed), `undefined` when missing. */
+function readRegularFile(file) {
+  let stat;
   try {
-    text = fs.readFileSync(file, 'utf8');
+    stat = fs.statSync(file);
   } catch (error) {
     if (error.code === 'ENOENT') return undefined;
     throw error;
   }
+  // A FIFO or device would block or stream forever.
+  if (!stat.isFile()) throw new Error('not a regular file');
+  return fs.readFileSync(file, 'utf8');
+}
+
+/** Parsed JSON object, `undefined` when missing; throws when invalid. */
+function readJsonObject(file) {
+  const text = readRegularFile(file);
+  if (text === undefined) return undefined;
   const value = JSON.parse(text);
   if (!isObject(value)) throw new Error('not a JSON object');
   return value;
 }
 
-function writeJsonAtomic(file, value, mode) {
-  const temp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode });
-  fs.renameSync(temp, file);
+// The temp name is unguessable and created exclusively, so a planted link at
+// that name cannot redirect the write. The rename replaces a link at `file`
+// with a regular file instead of writing through it.
+function writeAtomic(file, text, mode = 0o644) {
+  const temp = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  fs.writeFileSync(temp, text, { mode, flag: 'wx' });
+  try {
+    fs.renameSync(temp, file);
+  } catch (error) {
+    fs.rmSync(temp, { force: true });
+    throw error;
+  }
+}
+
+const writeJsonAtomic = (file, value, mode) =>
+  writeAtomic(file, `${JSON.stringify(value, null, 2)}\n`, mode);
+
+function lstatOrUndefined(file) {
+  try {
+    return fs.lstatSync(file);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The real path, resolving the nearest existing ancestor of a missing one. */
+function realPath(file) {
+  const missing = [];
+  let current = path.resolve(file);
+  for (;;) {
+    try {
+      // .native returns the on-disk case, so ~/.CLAUDE resolves to ~/.claude.
+      return path.join(fs.realpathSync.native(current), ...missing);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(file);
+      missing.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+/** Device and inode of `file` (links followed), `undefined` when missing. */
+function identity(file) {
+  try {
+    const stat = fs.statSync(file);
+    return `${stat.dev}:${stat.ino}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Identities of `file` and every folder above it. */
+function selfAndAncestors(file) {
+  const ids = new Set();
+  let current = realPath(file);
+  for (;;) {
+    const id = identity(current);
+    if (id) ids.add(id);
+    const parent = path.dirname(current);
+    if (parent === current) return ids;
+    current = parent;
+  }
+}
+
+// Files of the user's own config that prepare must never replace, paired
+// with the path in the subc dir that prepare writes.
+// A plugins link from an earlier build is unlinked, never written through,
+// before the plugin files are written, so its target needs no check.
+function guardedWrites(dir, home, source) {
+  const pluginsLink = lstatOrUndefined(path.join(dir, 'plugins'));
+  const plugins = pluginsLink?.isSymbolicLink() ? [] : PLUGIN_INDEX_FILES;
+  return [
+    [path.join(source, 'settings.json'), path.join(dir, 'settings.json')],
+    [path.join(home, '.claude.json'), path.join(dir, '.claude.json')],
+    ...plugins.map((name) => [
+      path.join(source, 'plugins', name),
+      path.join(dir, 'plugins', name),
+    ]),
+  ];
+}
+
+/**
+ * Why `dir` must not be prepared, or `undefined` when it is safe. Compares
+ * file identities, not path text, so no spelling, case or link can alias the
+ * user's config into the dir.
+ */
+function unsafeDirReason(dir, home, source) {
+  if (!path.isAbsolute(dir)) return `${dir} is not an absolute path`;
+  const sourceId = identity(source);
+  if (sourceId && selfAndAncestors(dir).has(sourceId)) {
+    return `${dir} resolves into ~/.claude`;
+  }
+  const dirIds = selfAndAncestors(dir);
+  for (const name of [...SHARED_ENTRIES, 'plugins']) {
+    const targetId = identity(path.join(source, name));
+    if (targetId && dirIds.has(targetId)) {
+      return `${dir} resolves into the folder behind ~/.claude/${name}`;
+    }
+  }
+  const dirId = identity(dir);
+  const homeJson = identity(
+    path.dirname(realPath(path.join(home, '.claude.json'))),
+  );
+  if (dirId && (selfAndAncestors(source).has(dirId) || dirId === homeJson)) {
+    return `${dir} resolves to a folder that holds your Claude config`;
+  }
+  for (const [user, own] of guardedWrites(dir, home, source)) {
+    const userId = identity(user);
+    // A link at `own` is replaced by the rename, never written through.
+    if (lstatOrUndefined(own)?.isSymbolicLink()) continue;
+    if (userId && userId === identity(own)) {
+      return `${own} is your own ${path.basename(user)}`;
+    }
+  }
+  return undefined;
+}
+
+function sameFile(a, b) {
+  try {
+    const left = fs.statSync(a);
+    const right = fs.statSync(b);
+    return left.dev === right.dev && left.ino === right.ino;
+  } catch {
+    return false;
+  }
 }
 
 function linkEntry(target, link) {
@@ -90,29 +239,55 @@ function linkEntry(target, link) {
   }
 }
 
+function shareEntry(dir, source, name, warnings) {
+  const target = path.join(source, name);
+  const link = path.join(dir, name);
+  if (ALWAYS_SHARED_DIRS.has(name) && !fs.existsSync(target)) {
+    fs.mkdirSync(target, { recursive: true });
+  }
+  if (!fs.existsSync(target)) return;
+  const existing = lstatOrUndefined(link);
+  if (existing?.isSymbolicLink() || (existing && sameFile(link, target))) {
+    return;
+  }
+  if (existing) {
+    warnings.push(
+      `${link} is a real ${existing.isDirectory() ? 'directory' : 'file'}, so subc sessions do not share ~/.claude/${name}; move it aside to share it.`,
+    );
+    return;
+  }
+  linkEntry(target, link);
+}
+
 function shareEntries(dir, source, warnings) {
   for (const name of SHARED_ENTRIES) {
-    const target = path.join(source, name);
-    const link = path.join(dir, name);
-    if (ALWAYS_SHARED_DIRS.has(name)) fs.mkdirSync(target, { recursive: true });
-    if (!fs.existsSync(target)) continue;
-    let existing;
     try {
-      existing = fs.lstatSync(link);
-    } catch {
-      existing = undefined;
-    }
-    if (existing?.isSymbolicLink()) continue;
-    if (existing) {
-      warnings.push(
-        `${link} is a real ${existing.isDirectory() ? 'directory' : 'file'}, so subc sessions do not share ~/.claude/${name}; move it aside to share it.`,
-      );
-      continue;
-    }
-    try {
-      linkEntry(target, link);
+      shareEntry(dir, source, name, warnings);
     } catch (error) {
-      warnings.push(`Could not link ${link} to ${target}: ${error.message}`);
+      warnings.push(`Could not share ~/.claude/${name}: ${error.message}`);
+    }
+  }
+}
+
+function copyPluginIndex(dir, source, warnings) {
+  const own = path.join(dir, 'plugins');
+  const existing = lstatOrUndefined(own);
+  // An earlier build linked the whole folder. Removing a link never touches
+  // its target.
+  if (existing?.isSymbolicLink()) fs.unlinkSync(own);
+  else if (existing && !existing.isDirectory()) {
+    warnings.push(`${own} is not a directory, so plugins are not shared.`);
+    return;
+  }
+  fs.mkdirSync(own, { recursive: true });
+  for (const name of PLUGIN_INDEX_FILES) {
+    try {
+      const text = readRegularFile(path.join(source, 'plugins', name));
+      if (text !== undefined) writeAtomic(path.join(own, name), text, 0o600);
+    } catch (error) {
+      warnings.push(
+        `Could not copy ~/.claude/plugins/${name}: ${error.message}`,
+      );
     }
   }
 }
@@ -181,16 +356,17 @@ function syncState(dir, home, warnings) {
     next.projects = mergeProjects(current.projects, user.projects);
   }
   writeJsonAtomic(file, next, 0o600);
-  fs.chmodSync(file, 0o600);
 }
 
 /**
  * Make `dir` a Claude Code config dir that shares the user's ~/.claude setup
  * and keeps only subc's own settings apart. Never writes into ~/.claude except
- * to create ~/.claude/projects, and never deletes anything.
+ * to create ~/.claude/projects, and never deletes anything there. Problems
+ * come back as warnings; preparing never throws, so a launch always proceeds.
  *
  * @param {{ dir: string, home?: string, launchEnvNames?: Iterable<string> }} options
- * @returns {{ warnings: string[] }}
+ * @returns {{ warnings: string[], refused: boolean }} `refused` means the
+ *   dir aliases the user's own config; the launch must not run on it.
  */
 export function prepareClaudeConfigDir({
   dir,
@@ -199,27 +375,44 @@ export function prepareClaudeConfigDir({
 }) {
   const warnings = [];
   const source = path.join(home, '.claude');
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  shareEntries(dir, source, warnings);
-  rebuildSettings(dir, source, new Set(launchEnvNames), warnings);
-  syncState(dir, home, warnings);
-  return { warnings };
+  const unsafe = unsafeDirReason(dir, home, source);
+  if (unsafe) {
+    warnings.push(
+      `Refused to use ${dir} as the subc Claude config dir: ${unsafe}. Claude Code would write into your own config there. Point SUBC_CONFIG_DIR somewhere else, or run subc claude --no-isolate.`,
+    );
+    return { warnings, refused: true };
+  }
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    shareEntries(dir, source, warnings);
+    copyPluginIndex(dir, source, warnings);
+    rebuildSettings(dir, source, new Set(launchEnvNames), warnings);
+    syncState(dir, home, warnings);
+  } catch (error) {
+    warnings.push(
+      `Could not prepare the subc Claude config dir ${dir}: ${error.message}`,
+    );
+  }
+  return { warnings, refused: false };
 }
 
 /**
  * Prepare the isolated dir for a planned Claude Code launch, when subc chose
- * it. A CLAUDE_CONFIG_DIR the user set themselves (in `inputEnv`) and an
- * opted-out launch (no CLAUDE_CONFIG_DIR) are left alone.
+ * it. A CLAUDE_CONFIG_DIR the user set themselves (in `inputEnv`, even blank)
+ * and an opted-out launch (no CLAUDE_CONFIG_DIR) are left alone.
  *
  * @param {{ env: { name: string }[] }} agent
  * @param {Record<string, string | undefined>} launchEnv the planned launch env
  * @param {Record<string, string | undefined>} inputEnv the env before planning
  * @param {{ home?: string }} [options]
- * @returns {string[]} warnings for the user
+ * @returns {{ warnings: string[], refused: boolean }}
  */
 export function prepareClaudeLaunch(agent, launchEnv, inputEnv, options = {}) {
   const dir = launchEnv.CLAUDE_CONFIG_DIR;
-  if (!dir || inputEnv.CLAUDE_CONFIG_DIR?.trim()) return [];
+  const own = inputEnv.CLAUDE_CONFIG_DIR;
+  if (!dir || (own !== undefined && own !== '')) {
+    return { warnings: [], refused: false };
+  }
   const launchEnvNames = agent.env.map((entry) => entry.name);
-  return prepareClaudeConfigDir({ dir, launchEnvNames, ...options }).warnings;
+  return prepareClaudeConfigDir({ dir, launchEnvNames, ...options });
 }

@@ -547,8 +547,18 @@ async function launchAgent(agent, argv, profile, headless) {
   const launchEnv = headless ? { ...env, CLAUDE_GATEWAY_URL: '' } : env;
   const plan = launchPlan(agent, { env: launchEnv, ...headlessParts(rest) });
   if (agent.id === CLAUDE_CODE) {
-    for (const warning of prepareClaudeLaunch(agent, plan.env, launchEnv)) {
-      console.error(`  ${c.yellow}${warning}${c.reset}`);
+    const { warnings, refused } = prepareClaudeLaunch(
+      agent,
+      plan.env,
+      launchEnv,
+    );
+    const color = refused ? c.red : c.yellow;
+    for (const warning of warnings) {
+      console.error(`  ${color}${warning}${c.reset}`);
+    }
+    if (refused) {
+      process.exitCode = 1;
+      return 1;
     }
   }
   return runCommand(planCommand(agent, plan, binDir));

@@ -1135,6 +1135,31 @@ test('Windows agents other than Claude get the gateway and key as SUBCONSCIOUS_*
   assert.equal(claude.env.SUBCONSCIOUS_GATEWAY_URL, undefined);
 });
 
+test('Windows Claude launch never runs on a dir inside ~/.claude', async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'subc-win-refuse-'));
+  try {
+    await fs.mkdir(path.join(home, '.claude'), { recursive: true });
+    const spec = await windowsLaunch('claude-code', [], {
+      ...env,
+      SUBC_CONFIG_DIR: path.join(home, '.claude'),
+    });
+    let ran = false;
+    const code = await executeWindowsLaunch(
+      spec,
+      async () => {
+        ran = true;
+        return 0;
+      },
+      { home },
+    );
+    assert.equal(code, 1);
+    assert.equal(ran, false);
+    assert.deepEqual(await fs.readdir(path.join(home, '.claude')), []);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
 test('Windows Claude launch prepares the shared config dir only when it runs', async () => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'subc-win-claude-'));
   try {

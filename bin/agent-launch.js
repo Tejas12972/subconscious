@@ -33,6 +33,9 @@ function tokensFor(agent, env, extra) {
         .toLowerCase();
       if (ISOLATE_OFF.has(setting)) return '';
       const base = String(env.SUBC_CONFIG_DIR ?? '').trim() || configDir();
+      // A relative base would put the config, MCP tokens included, in the
+      // current directory; use ~/.claude unchanged instead.
+      if (!path.isAbsolute(base)) return '';
       return path.join(base, 'claude-code');
     },
     ...extra,

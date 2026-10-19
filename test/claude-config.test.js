@@ -56,6 +56,19 @@ function fakeHome({ settings, claudeJson } = {}) {
   return { home, source, dir: path.join(home, '.subconscious', 'claude-code') };
 }
 
+/** Run `fn` with a fresh temp dir as the working directory. */
+function inTempCwd(fn) {
+  const cwd = process.cwd();
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'subc-claude-cwd-'));
+  roots.push(temp);
+  process.chdir(temp);
+  try {
+    return fn(temp);
+  } finally {
+    process.chdir(cwd);
+  }
+}
+
 const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 
 test('shared entries link back to ~/.claude, so the user setup and sessions are one copy', () => {
@@ -276,4 +289,218 @@ test('the launch env subc sets wins over the user settings env', () => {
   assert.deepEqual(readJson(path.join(dir, 'settings.json')).env, {
     OTHER: 'x',
   });
+});
+
+test('a dir that resolves to ~/.claude or home is refused and nothing is written', () => {
+  const { home, source } = fakeHome();
+  const before = snapshot(home);
+  fs.mkdirSync(path.join(home, '.subconscious'), { recursive: true });
+  const linked = path.join(home, '.subconscious', 'claude-code');
+  fs.symlinkSync(source, linked);
+  for (const dir of [linked, source, path.join(source, 'nested'), home]) {
+    const { warnings } = prepareClaudeConfigDir({ dir, home });
+    assert.equal(warnings.length, 1, dir);
+    assert.match(warnings[0], /refus/i);
+  }
+  fs.unlinkSync(linked);
+  assert.deepEqual(snapshot(home), before);
+});
+
+test('a relative dir is refused', () => {
+  const { home } = fakeHome();
+  inTempCwd((cwd) => {
+    const { warnings } = prepareClaudeConfigDir({ dir: 'claude-code', home });
+    assert.match(warnings.join('\n'), /absolute/);
+    assert.deepEqual(fs.readdirSync(cwd), []);
+  });
+});
+
+test('a blank config dir never reaches prepare', () => {
+  const agent = agentById('claude-code');
+  const { home } = fakeHome();
+  inTempCwd((cwd) => {
+    const blank = { CLAUDE_CONFIG_DIR: '   ' };
+    assert.deepEqual(prepareClaudeLaunch(agent, blank, blank, { home }), {
+      warnings: [],
+      refused: false,
+    });
+    assert.deepEqual(fs.readdirSync(cwd), []);
+  });
+});
+
+test('special files and a ~/.claude that is a file warn instead of hanging or throwing', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'subc-claude-odd-'));
+  roots.push(home);
+  fs.writeFileSync(path.join(home, '.claude'), 'not a dir');
+  fs.mkdirSync(path.join(home, '.claude.json'));
+  const dir = path.join(home, '.subconscious', 'claude-code');
+  const { warnings } = prepareClaudeConfigDir({ dir, home });
+  assert.ok(warnings.length >= 1);
+  assert.equal(
+    fs.readFileSync(path.join(home, '.claude'), 'utf8'),
+    'not a dir',
+  );
+});
+
+test('plugins get their own index in the subc dir, so plugin changes in subc stay there', () => {
+  const { home, source, dir } = fakeHome();
+  const plugins = path.join(source, 'plugins');
+  fs.mkdirSync(path.join(plugins, 'cache', 'm', 'p', '1.0.0'), {
+    recursive: true,
+  });
+  const index = JSON.stringify({
+    version: 2,
+    plugins: {
+      'p@m': [{ installPath: path.join(plugins, 'cache', 'm', 'p', '1.0.0') }],
+    },
+  });
+  fs.writeFileSync(path.join(plugins, 'installed_plugins.json'), index);
+  fs.writeFileSync(path.join(plugins, 'known_marketplaces.json'), '{"m":{}}');
+
+  prepareClaudeConfigDir({ dir, home });
+  const own = path.join(dir, 'plugins');
+  assert.equal(fs.lstatSync(own).isSymbolicLink(), false);
+  assert.equal(
+    fs.readFileSync(path.join(own, 'installed_plugins.json'), 'utf8'),
+    index,
+  );
+  assert.equal(
+    fs.existsSync(path.join(own, 'cache')),
+    false,
+    'the cache is never shared',
+  );
+
+  // An uninstall inside subc rewrites only the subc copy.
+  fs.writeFileSync(
+    path.join(own, 'installed_plugins.json'),
+    '{"version":2,"plugins":{}}',
+  );
+  assert.equal(
+    fs.readFileSync(path.join(plugins, 'installed_plugins.json'), 'utf8'),
+    index,
+  );
+  // The next launch restores the user's plugins.
+  prepareClaudeConfigDir({ dir, home });
+  assert.equal(
+    fs.readFileSync(path.join(own, 'installed_plugins.json'), 'utf8'),
+    index,
+  );
+});
+
+test('an old plugins link from an earlier build is replaced, never followed', () => {
+  const { home, source, dir } = fakeHome();
+  fs.mkdirSync(path.join(source, 'plugins'), { recursive: true });
+  fs.writeFileSync(
+    path.join(source, 'plugins', 'installed_plugins.json'),
+    '{"x":1}',
+  );
+  fs.mkdirSync(dir, { recursive: true });
+  fs.symlinkSync(path.join(source, 'plugins'), path.join(dir, 'plugins'));
+  prepareClaudeConfigDir({ dir, home });
+  assert.equal(fs.lstatSync(path.join(dir, 'plugins')).isSymbolicLink(), false);
+  assert.equal(
+    fs.readFileSync(
+      path.join(source, 'plugins', 'installed_plugins.json'),
+      'utf8',
+    ),
+    '{"x":1}',
+  );
+});
+
+/** Every file under `root` with its bytes, following no links. */
+function snapshot(root) {
+  const out = {};
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile())
+        out[path.relative(root, full)] = fs.readFileSync(full, 'utf8');
+      else out[path.relative(root, full)] = `link:${fs.readlinkSync(full)}`;
+    }
+  };
+  walk(root);
+  return out;
+}
+
+test('a case-variant link to ~/.claude is refused', (t) => {
+  const { home, source } = fakeHome();
+  if (!fs.existsSync(path.join(home, '.CLAUDE'))) {
+    t.skip('case-sensitive file system');
+    return;
+  }
+  const before = snapshot(source);
+  fs.mkdirSync(path.join(home, '.subconscious'), { recursive: true });
+  const linked = path.join(home, '.subconscious', 'claude-code');
+  fs.symlinkSync(path.join(home, '.CLAUDE'), linked);
+  const { warnings } = prepareClaudeConfigDir({ dir: linked, home });
+  assert.match(warnings.join('\n'), /refus/i);
+  assert.deepEqual(snapshot(source), before);
+});
+
+test('a dir that holds the real target of the user settings is never written over', () => {
+  const { home, source } = fakeHome();
+  // Stow-style dotfiles: ~/.claude/settings.json links into ~/dotfiles/claude.
+  const dotfiles = path.join(home, 'dotfiles', 'claude');
+  fs.mkdirSync(dotfiles, { recursive: true });
+  fs.renameSync(
+    path.join(source, 'settings.json'),
+    path.join(dotfiles, 'settings.json'),
+  );
+  fs.symlinkSync(
+    path.join(dotfiles, 'settings.json'),
+    path.join(source, 'settings.json'),
+  );
+  const before = snapshot(dotfiles);
+
+  fs.mkdirSync(path.join(home, '.subconscious'), { recursive: true });
+  const linked = path.join(home, '.subconscious', 'claude-code');
+  fs.symlinkSync(dotfiles, linked);
+  const { warnings } = prepareClaudeConfigDir({ dir: linked, home });
+  assert.match(warnings.join('\n'), /refus/i);
+  assert.deepEqual(snapshot(dotfiles), before);
+});
+
+test('a planted link at the subc settings file is replaced, never written through', () => {
+  const { home, source, dir } = fakeHome();
+  const before = snapshot(source);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.symlinkSync(
+    path.join(source, 'settings.json'),
+    path.join(dir, 'settings.json'),
+  );
+  const { refused } = prepareClaudeConfigDir({ dir, home });
+  assert.equal(refused, false);
+  assert.equal(
+    fs.lstatSync(path.join(dir, 'settings.json')).isSymbolicLink(),
+    false,
+  );
+  assert.deepEqual(snapshot(source), before);
+});
+
+test('a dir that is the real target of a shared entry is refused', () => {
+  const { home, source } = fakeHome();
+  const dotSkills = path.join(home, 'dot', 'skills');
+  fs.mkdirSync(path.dirname(dotSkills), { recursive: true });
+  fs.renameSync(path.join(source, 'skills'), dotSkills);
+  fs.symlinkSync(dotSkills, path.join(source, 'skills'));
+  const before = snapshot(path.join(home, 'dot'));
+  for (const dir of [dotSkills, path.join(dotSkills, 'nested')]) {
+    const { refused, warnings } = prepareClaudeConfigDir({ dir, home });
+    assert.equal(refused, true, dir);
+    assert.match(warnings.join('\n'), /refus/i);
+  }
+  assert.deepEqual(snapshot(path.join(home, 'dot')), before);
+});
+
+test('a refused dir stops the launch', () => {
+  const agent = agentById('claude-code');
+  const { home, source } = fakeHome();
+  const result = prepareClaudeLaunch(
+    agent,
+    { CLAUDE_CONFIG_DIR: source },
+    {},
+    { home },
+  );
+  assert.equal(result.refused, true);
 });

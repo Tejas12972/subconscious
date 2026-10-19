@@ -276,9 +276,12 @@ export async function windowsLaunch(
 
 export async function executeWindowsLaunch(spec, run, prepareOptions) {
   try {
-    for (const warning of spec.prepare?.(prepareOptions) ?? []) {
+    const prepared = spec.prepare?.(prepareOptions);
+    for (const warning of prepared?.warnings ?? []) {
       console.error(`  ${warning}`);
     }
+    // Claude Code would write into the user's own config there.
+    if (prepared?.refused) return 1;
     const options =
       spec.input === undefined
         ? { env: spec.env }
