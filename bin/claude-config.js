@@ -410,6 +410,29 @@ function readQuietly(file) {
   }
 }
 
+/**
+ * Make sure `dir` is a subc dir: an earlier launch's marker, or a new or
+ * empty folder that is claimed now. Returns why a folder is not one, or
+ * `undefined`. A Claude config folder that subc did not make is never
+ * prepared, wherever it sits.
+ */
+function claimDir(dir) {
+  const marker = path.join(dir, WRITTEN_FILE);
+  if (lstatOrUndefined(marker)) return undefined;
+  const existing = lstatOrUndefined(dir);
+  if (existing) {
+    const holdsConfig = ['settings.json', '.claude.json', 'projects'].some(
+      (name) => lstatOrUndefined(path.join(dir, name)),
+    );
+    if (holdsConfig) {
+      return `${dir} holds a Claude config that subc did not make. If it is an old subc folder, rename it and launch again.`;
+    }
+  }
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeJsonAtomic(marker, {}, 0o600);
+  return undefined;
+}
+
 function readWritten(dir) {
   try {
     return readJsonObject(path.join(dir, WRITTEN_FILE)) ?? {};
@@ -441,7 +464,14 @@ export function prepareClaudeConfigDir({
   launchEnvNames = [],
 }) {
   const warnings = [];
-  const unsafe = unsafeDirReason(dir, source, stateFile);
+  let unsafe = unsafeDirReason(dir, source, stateFile);
+  if (!unsafe) {
+    try {
+      unsafe = claimDir(dir);
+    } catch (error) {
+      unsafe = `could not create it: ${error.message}`;
+    }
+  }
   if (unsafe) {
     warnings.push(
       `Refused to use ${dir} as the subc Claude config dir: ${unsafe}. Claude Code would write into your own config there. Point SUBC_CONFIG_DIR somewhere else, or run subc claude --no-isolate.`,

@@ -69,6 +69,12 @@ function inTempCwd(fn) {
   }
 }
 
+/** A subc dir an earlier launch made, as its marker file shows. */
+function markSubcDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '.subc-written.json'), '{}');
+}
+
 const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 
 test('shared entries link back to ~/.claude, so the user setup and sessions are one copy', () => {
@@ -174,7 +180,7 @@ test('settings.json follows the user settings but keeps the subc model pick', ()
 
 test('.claude.json gets MCP servers, trust and onboarding but never login state', () => {
   const { home, dir } = fakeHome();
-  fs.mkdirSync(dir, { recursive: true });
+  markSubcDir(dir);
   fs.writeFileSync(
     path.join(dir, '.claude.json'),
     JSON.stringify({
@@ -211,6 +217,7 @@ test('.claude.json gets MCP servers, trust and onboarding but never login state'
 
 test('existing files in the isolated dir are never replaced or deleted', () => {
   const { home, dir } = fakeHome();
+  markSubcDir(dir);
   fs.mkdirSync(path.join(dir, 'projects'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'projects', 'old.jsonl'), '{}');
   fs.writeFileSync(path.join(dir, 'CLAUDE.md'), '# local\n');
@@ -512,7 +519,7 @@ test('an old plugins link from an earlier build is replaced, never followed', ()
     path.join(source, 'plugins', 'installed_plugins.json'),
     '{"x":1}',
   );
-  fs.mkdirSync(dir, { recursive: true });
+  markSubcDir(dir);
   fs.symlinkSync(path.join(source, 'plugins'), path.join(dir, 'plugins'));
   prepareClaudeConfigDir({ dir, home });
   assert.equal(fs.lstatSync(path.join(dir, 'plugins')).isSymbolicLink(), false);
@@ -582,7 +589,7 @@ test('a dir that holds the real target of the user settings is never written ove
 test('a planted link at the subc settings file is replaced, never written through', () => {
   const { home, source, dir } = fakeHome();
   const before = snapshot(source);
-  fs.mkdirSync(dir, { recursive: true });
+  markSubcDir(dir);
   fs.symlinkSync(
     path.join(source, 'settings.json'),
     path.join(dir, 'settings.json'),
@@ -702,7 +709,7 @@ test('MCP servers added inside subc are saved aside and named', () => {
 
 test('a first launch with an existing subc dir reports nothing it cannot compare', () => {
   const { home, dir } = fakeHome();
-  fs.mkdirSync(dir, { recursive: true });
+  markSubcDir(dir);
   fs.writeFileSync(
     path.join(dir, 'settings.json'),
     JSON.stringify({ hooks: { x: 1 } }),
@@ -756,6 +763,7 @@ test('a planted link in the subc plugin cache stops the copy', () => {
   fs.mkdirSync(path.join(source, 'plugins', 'cache', 'm', 'v', 'abc'), {
     recursive: true,
   });
+  markSubcDir(dir);
   fs.mkdirSync(path.join(dir, 'plugins'), { recursive: true });
   fs.symlinkSync(
     path.join(source, 'plugins', 'cache'),
@@ -848,4 +856,29 @@ test('a source that is not a Claude config folder gets nothing created in it', (
       own,
     );
   }
+});
+
+test('a Claude config folder at the subc path that subc did not make is refused', () => {
+  const agent = agentById('claude-code');
+  const { home } = fakeHome();
+  const subcBase = path.join(home, 'base');
+  const own = customConfig(home, path.join('base', 'claude-code'));
+  const before = snapshot(own);
+  const result = prepareClaudeLaunch(
+    agent,
+    { CLAUDE_CONFIG_DIR: own, SUBC_CONFIG_DIR: subcBase },
+    { CLAUDE_CONFIG_DIR: own },
+    { home },
+  );
+  assert.equal(result.refused, true);
+  assert.match(result.warnings.join('\n'), /did not make/);
+  assert.deepEqual(snapshot(own), before);
+});
+
+test('an empty existing dir is claimed as the subc dir', () => {
+  const { home, dir } = fakeHome();
+  fs.mkdirSync(dir, { recursive: true });
+  const { refused } = prepareClaudeConfigDir({ dir, home });
+  assert.equal(refused, false);
+  assert.equal(fs.existsSync(path.join(dir, '.subc-written.json')), true);
 });
