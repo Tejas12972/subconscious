@@ -70,6 +70,8 @@ test('Claude launch points Claude Code at the isolated subc config dir', async (
     '#!/bin/sh\nprintf \'%s\' "$CLAUDE_CONFIG_DIR"\n',
     { mode: 0o755 },
   );
+  // A CLAUDE_CONFIG_DIR in the developer's shell would win over isolation.
+  const { CLAUDE_CONFIG_DIR: _shellConfigDir, ...shellEnv } = process.env;
   const base = {
     PATH: `${isolateDir}:${process.env.PATH}`,
     GATEWAY_URL: 'https://gateway.example',
@@ -79,7 +81,7 @@ test('Claude launch points Claude Code at the isolated subc config dir', async (
   };
 
   const launched = runSync(
-    launchCommand('claude-code', { env: { ...process.env, ...base } }),
+    launchCommand('claude-code', { env: { ...shellEnv, ...base } }),
   );
   assert.equal(launched.status, 0, launched.stderr);
   assert.equal(
@@ -90,7 +92,7 @@ test('Claude launch points Claude Code at the isolated subc config dir', async (
 
   const flagged = runSync(
     launchCommand('claude-code', {
-      env: { ...process.env, ...base },
+      env: { ...shellEnv, ...base },
       args: ['--no-isolate'],
     }),
   );
@@ -99,7 +101,7 @@ test('Claude launch points Claude Code at the isolated subc config dir', async (
 
   const profileOptOut = runSync(
     launchCommand('claude-code', {
-      env: { ...process.env, ...base, CLAUDE_CODE_ISOLATE: 'off' },
+      env: { ...shellEnv, ...base, CLAUDE_CODE_ISOLATE: 'off' },
     }),
   );
   assert.equal(profileOptOut.status, 0, profileOptOut.stderr);
@@ -111,7 +113,7 @@ test('Claude launch points Claude Code at the isolated subc config dir', async (
 
   const own = runSync(
     launchCommand('claude-code', {
-      env: { ...process.env, ...base, CLAUDE_CONFIG_DIR: '/custom/claude' },
+      env: { ...shellEnv, ...base, CLAUDE_CONFIG_DIR: '/custom/claude' },
     }),
   );
   assert.equal(own.status, 0, own.stderr);
